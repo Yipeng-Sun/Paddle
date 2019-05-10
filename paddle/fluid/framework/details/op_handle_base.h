@@ -15,6 +15,8 @@
 #pragma once
 #include <map>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "paddle/fluid/framework/details/var_handle.h"
 #include "paddle/fluid/framework/ir/node.h"
@@ -25,17 +27,29 @@ namespace paddle {
 namespace framework {
 namespace details {
 
-constexpr char kLocalExecScopeName[] = "@LCOAL_SCOPE@";
+constexpr char kLocalExecScopeName[] = "@LOCAL_SCOPE@";
 
 // Wraps ir::Node and provide helper utilities.
 // It's responsible for populating necessary fields of ir::Node.
 class OpHandleBase {
  public:
-  explicit OpHandleBase(ir::Node *node) : node_(node) {}
+  /**
+   * NOTE(zjl): Some op should have higher priority than others.
+   * The higher priority op would run first without switching
+   * threads in Executor.
+   */
+  enum Priority { kHighest = 0, kNormal = 1 };
+
+  // Owned by `node`. No need to be deleted explicitly.
+  explicit OpHandleBase(ir::Node *node) : node_(node) {
+    node_->WrappedBy(this);
+  }
 
   virtual ~OpHandleBase();
 
   std::string DebugString() const;
+
+  virtual Priority GetPriority() const { return kNormal; }
 
   virtual std::string Name() const = 0;
 
@@ -64,7 +78,11 @@ class OpHandleBase {
   virtual bool IsMultiDeviceTransfer() { return false; }
 
   const platform::DeviceContext *DeviceContext(platform::Place place) {
-    return dev_ctxes_[place];
+    auto it = dev_ctxes_.find(place);
+    return it != dev_ctxes_.end() ? it->second : nullptr;
+  }
+  const std::map<platform::Place, platform::DeviceContext *> &DeviceContext() {
+    return dev_ctxes_;
   }
 
   void SetDeviceContext(platform::Place place, platform::DeviceContext *ctx_) {

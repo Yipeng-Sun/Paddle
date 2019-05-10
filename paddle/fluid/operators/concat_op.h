@@ -17,7 +17,7 @@ limitations under the License. */
 #include <utility>
 #include <vector>
 #include "paddle/fluid/framework/op_registry.h"
-#include "paddle/fluid/operators/math/concat.h"
+#include "paddle/fluid/operators/math/concat_and_split.h"
 #include "paddle/fluid/operators/strided_memcpy.h"
 
 namespace paddle {
@@ -37,6 +37,9 @@ class ConcatKernel : public framework::OpKernel<T> {
     if (axis == 0 && ins.size() < 10) {
       size_t output_offset = 0;
       for (auto* in : ins) {
+        if (!in || in->numel() == 0UL) {
+          continue;
+        }
         auto in_stride = framework::stride_numel(in->dims());
         auto out_stride = framework::stride_numel(out->dims());
         StridedNumelCopyWithAxis<T>(ctx.device_context(), axis,
@@ -45,9 +48,13 @@ class ConcatKernel : public framework::OpKernel<T> {
         output_offset += in_stride[axis];
       }
     } else {
-      std::vector<framework::Tensor> inputs(ins.size());
+      std::vector<framework::Tensor> inputs;
       for (size_t j = 0; j < ins.size(); ++j) {
-        inputs[j] = *ins[j];
+        if (ins[j] && ins[j]->numel() > 0) {
+          inputs.push_back(*ins[j]);
+        } else {
+          continue;
+        }
       }
       auto& dev_ctx = ctx.template device_context<DeviceContext>();
       paddle::operators::math::ConcatFunctor<DeviceContext, T> concat_functor;
@@ -82,36 +89,25 @@ class ConcatGradKernel : public framework::OpKernel<T> {
     // get output tensor that the name is not kEmptyVarName
     std::vector<framework::Tensor*> outputs;
     for (size_t j = 0; j < outs.size(); ++j) {
-      if (out_var_names[j] != framework::kEmptyVarName) {
+      if (out_var_names[j] != framework::kEmptyVarName &&
+          outs[j]->numel() != 0UL) {
         outs[j]->mutable_data<T>(ctx.GetPlace());
         outputs.push_back(outs[j]);
       } else {
         outputs.push_back(nullptr);
       }
     }
+    auto& dev_ctx = ctx.template device_context<DeviceContext>();
 
     // Sometimes direct copies will be faster, this maybe need deeply analysis.
     if (axis == 0 && outs.size() < 10) {
-      size_t input_offset = 0;
-      const auto in_stride = framework::stride_numel(out_grad->dims());
-
-      for (size_t i = 0; i < outs.size(); ++i) {
-        auto out_stride = framework::stride_numel(ins[i]->dims());
-        auto* out = outputs[i];
-        if (out != nullptr) {
-          StridedNumelCopyWithAxis<T>(
-              ctx.device_context(), axis, out->data<T>(), out_stride,
-              out_grad->data<T>() + input_offset, in_stride, out_stride[axis]);
-        }
-        input_offset += out_stride[axis];
-      }
+      std::vector<const framework::Tensor*> ref_shape;
+      ref_shape.insert(ref_shape.begin(), ins.begin(), ins.end());
+      StridedMemcpyWithAxis0<T>(dev_ctx, *out_grad, ref_shape, &outputs);
     } else {
-      auto& dev_ctx = ctx.template device_context<DeviceContext>();
-      paddle::operators::math::ConcatGradFunctor<DeviceContext, T>
-          concat_grad_functor;
-      concat_grad_functor(dev_ctx, *out_grad,
-                          ctx.MultiInput<framework::Tensor>("X"),
-                          static_cast<int>(axis), &outputs);
+      math::SplitFunctor<DeviceContext, T> split_functor;
+      split_functor(dev_ctx, *out_grad, ctx.MultiInput<framework::Tensor>("X"),
+                    static_cast<int>(axis), &outputs);
     }
   }
 };

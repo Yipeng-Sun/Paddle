@@ -13,15 +13,32 @@ See the License for the specific language governing permissions and
 limitations under the License. */
 
 #include "paddle/fluid/framework/executor.h"
-
+#include <deque>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include "google/protobuf/io/zero_copy_stream_impl.h"
+#include "google/protobuf/message.h"
+#include "google/protobuf/text_format.h"
 #include "paddle/fluid/framework/feed_fetch_method.h"
 #include "paddle/fluid/framework/lod_rank_table.h"
 #include "paddle/fluid/framework/lod_tensor_array.h"
 #include "paddle/fluid/framework/op_registry.h"
 #include "paddle/fluid/framework/reader.h"
-#include "paddle/fluid/operators/detail/macros.h"
+#include "paddle/fluid/framework/trainer_desc.pb.h"
+#include "paddle/fluid/framework/trainer_factory.h"
+#include "paddle/fluid/framework/transfer_scope_cache.h"
+#include "paddle/fluid/framework/variable_helper.h"
+#include "paddle/fluid/operators/controlflow/while_op_helper.h"
+#include "paddle/fluid/operators/distributed/distributed.h"
 #include "paddle/fluid/platform/place.h"
 #include "paddle/fluid/platform/profiler.h"
+
+#ifdef PADDLE_WITH_NGRAPH
+#include "paddle/fluid/operators/ngraph/ngraph_engine.h"
+DEFINE_bool(use_ngraph, false, "Use NGRAPH to run");
+#endif
 
 DECLARE_bool(benchmark);
 DEFINE_bool(use_mkldnn, false, "Use MKLDNN to run");
@@ -36,10 +53,15 @@ int kProgramId = -1;
 
 ExecutorPrepareContext::ExecutorPrepareContext(
     const framework::ProgramDesc& prog, size_t block_id)
-    : prog_(prog), block_id_(block_id) {
-  if (GetEagerDeletionThreshold() >= 0) {
-    ref_cnts_ = GetNonPersistableReferenceCount<int>(prog_, block_id_);
+    : prog_(prog), block_id_(block_id) {}
+
+void ExecutorPrepareContext::PrepareUnusedVars(
+    const std::vector<std::string>& keep_vars, bool force_disable_gc) {
+  force_disable_gc_ = force_disable_gc;
+  if (GetEagerDeletionThreshold() < 0 || force_disable_gc_) {
+    return;
   }
+  unused_vars_ = GetUnusedVars(prog_.Block(block_id_), ops_, keep_vars);
 }
 
 ExecutorPrepareContext::~ExecutorPrepareContext() {
@@ -50,40 +72,12 @@ Executor::Executor(const platform::Place& place) : place_(place) {}
 
 void Executor::Close() {
 #ifdef PADDLE_WITH_DISTRIBUTE
-  ::paddle::operators::distributed::RPCClient::GetInstance<
-      ::paddle::operators::distributed::GRPCClient>()
-      ->SendComplete();
+  // TODO(typhoonzero): complete message will need to use real trainer_id,
+  // except 0.
+  auto client =
+      paddle::operators::distributed::RPCClient::GetInstance<RPCCLIENT_T>(0);
+  client->SendComplete();
 #endif
-}
-
-void InitializeVariable(Variable* var, proto::VarType::Type var_type) {
-  if (var_type == proto::VarType::LOD_TENSOR) {
-    var->GetMutable<LoDTensor>();
-  } else if (var_type == proto::VarType::SELECTED_ROWS) {
-    var->GetMutable<SelectedRows>();
-  } else if (var_type == proto::VarType::FEED_MINIBATCH) {
-    var->GetMutable<FeedFetchList>();
-  } else if (var_type == proto::VarType::FETCH_LIST) {
-    var->GetMutable<FeedFetchList>();
-  } else if (var_type == proto::VarType::STEP_SCOPES) {
-    var->GetMutable<std::vector<framework::Scope>>();
-  } else if (var_type == proto::VarType::LOD_RANK_TABLE) {
-    var->GetMutable<LoDRankTable>();
-  } else if (var_type == proto::VarType::LOD_TENSOR_ARRAY) {
-    var->GetMutable<LoDTensorArray>();
-  } else if (var_type == proto::VarType::PLACE_LIST) {
-    var->GetMutable<platform::PlaceList>();
-  } else if (var_type == proto::VarType::READER) {
-    var->GetMutable<ReaderHolder>();
-  } else if (var_type == proto::VarType::RAW) {
-    // GetMutable will be called in operator
-  } else {
-    PADDLE_THROW(
-        "Variable type %d is not in "
-        "[LOD_TENSOR, SELECTED_ROWS, FEED_MINIBATCH, FETCH_LIST, "
-        "LOD_RANK_TABLE, PLACE_LIST, READER, RAW]",
-        var_type);
-  }
 }
 
 void Executor::CreateVariables(const ProgramDesc& pdesc, Scope* scope,
@@ -123,11 +117,42 @@ void Executor::CreateVariables(const ProgramDesc& pdesc, Scope* scope,
   }
 }
 
+void Executor::RunFromDataset(const ProgramDesc& main_program, Scope* scope,
+                              Dataset* dataset,
+                              const std::string& trainer_desc_str) {
+  VLOG(3) << "Start to RunFromDataset in executor";
+  TrainerDesc trainer_desc;
+  google::protobuf::TextFormat::ParseFromString(trainer_desc_str,
+                                                &trainer_desc);
+  VLOG(3) << "Going to create trainer, trainer class is "
+          << trainer_desc.class_name();
+  std::shared_ptr<TrainerBase> trainer;
+  trainer = TrainerFactory::CreateTrainer(trainer_desc.class_name());
+  // initialize trainer
+  VLOG(3) << "Going to initialize trainer";
+  trainer->Initialize(trainer_desc, dataset);
+  VLOG(3) << "Set root scope here";
+  trainer->SetScope(scope);
+  // prepare training environment and helper environment
+  VLOG(3) << "Try to init train environment";
+  trainer->InitTrainerEnv(main_program, place_);
+  VLOG(3) << "Try to init other environment";
+  trainer->InitOtherEnv(main_program);
+  // training and finalize training
+  VLOG(3) << "Trainer starts to run";
+  trainer->Run();
+  VLOG(3) << "Trainer going to finalize";
+  trainer->Finalize();
+  return;
+}
+
 void Executor::Run(const ProgramDesc& pdesc, Scope* scope, int block_id,
-                   bool create_local_scope, bool create_vars) {
+                   bool create_local_scope, bool create_vars,
+                   const std::vector<std::string>& skip_ref_cnt_vars,
+                   bool force_disable_gc) {
   platform::RecordBlock b(block_id);
   if (FLAGS_use_mkldnn) EnableMKLDNN(pdesc);
-  auto ctx = Prepare(pdesc, block_id);
+  auto ctx = Prepare(pdesc, block_id, skip_ref_cnt_vars, force_disable_gc);
   RunPreparedContext(ctx.get(), scope, create_local_scope, create_vars);
 }
 
@@ -293,7 +318,8 @@ void Executor::Run(const ProgramDesc& program, Scope* scope,
 }
 
 std::unique_ptr<ExecutorPrepareContext> Executor::Prepare(
-    const ProgramDesc& program, int block_id) {
+    const ProgramDesc& program, int block_id,
+    const std::vector<std::string>& skip_ref_cnt_vars, bool force_disable_gc) {
   std::unique_ptr<ExecutorPrepareContext> ctx(
       new ExecutorPrepareContext(program, block_id));
   PADDLE_ENFORCE_LT(static_cast<size_t>(block_id), program.Size());
@@ -301,20 +327,40 @@ std::unique_ptr<ExecutorPrepareContext> Executor::Prepare(
   for (auto& op_desc : block.AllOps()) {
     ctx->ops_.push_back(OpRegistry::CreateOp(*op_desc));
   }
+#ifdef PADDLE_WITH_NGRAPH
+  if (FLAGS_use_ngraph) {
+    paddle::operators::NgraphEngine::FuseNgraphOps(
+        ctx->prog_.Block(ctx->block_id_), &ctx->ops_);
+  }
+#endif
+  ctx->PrepareUnusedVars(skip_ref_cnt_vars, force_disable_gc);
   return ctx;
 }
 
 std::vector<std::shared_ptr<ExecutorPrepareContext>> Executor::Prepare(
-    const ProgramDesc& program, const std::vector<int>& block_ids) {
+    const ProgramDesc& program, const std::vector<int>& block_ids,
+    const std::vector<std::vector<std::string>>& skip_ref_cnt_vars,
+    bool force_disable_gc) {
+  PADDLE_ENFORCE(
+      skip_ref_cnt_vars.empty() || skip_ref_cnt_vars.size() == block_ids.size(),
+      "skip_ref_cnt_vars should be either empty or equals to block number %d",
+      block_ids.size());
   std::vector<std::shared_ptr<ExecutorPrepareContext>> result;
+  size_t idx = 0;
   for (auto& bid : block_ids) {
-    auto* ctx = new ExecutorPrepareContext(program, bid);
     PADDLE_ENFORCE_LT(static_cast<size_t>(bid), program.Size());
+    auto* ctx = new ExecutorPrepareContext(program, bid);
     auto& block = program.Block(bid);
     for (auto& op_desc : block.AllOps()) {
       ctx->ops_.push_back(OpRegistry::CreateOp(*op_desc));
     }
+    if (skip_ref_cnt_vars.empty()) {
+      ctx->PrepareUnusedVars(std::vector<std::string>(), force_disable_gc);
+    } else {
+      ctx->PrepareUnusedVars(skip_ref_cnt_vars[idx], force_disable_gc);
+    }
     result.push_back(std::shared_ptr<ExecutorPrepareContext>(ctx));
+    ++idx;
   }
   return result;
 }
@@ -322,6 +368,7 @@ std::vector<std::shared_ptr<ExecutorPrepareContext>> Executor::Prepare(
 void Executor::RunPreparedContext(ExecutorPrepareContext* ctx, Scope* scope,
                                   bool create_local_scope, bool create_vars,
                                   bool keep_kids) {
+  PADDLE_ENFORCE_NOT_NULL(scope);
   Scope* local_scope = scope;
   if (create_vars) {
     if (create_local_scope) {
@@ -331,79 +378,42 @@ void Executor::RunPreparedContext(ExecutorPrepareContext* ctx, Scope* scope,
   }
 
   int64_t max_memory_size = GetEagerDeletionThreshold();
-
-  std::unique_ptr<GarbageCollector<Tensor>> gc;
-  if (max_memory_size >= 0) {
-    ctx->ResetReferenceCount();
+  std::unique_ptr<GarbageCollector> gc;
+  // FIXME(zjl): recurrent_op is rather complex, we would
+  // disable gc forcely in recurrent_op
+  if (!ctx->force_disable_gc_ && max_memory_size >= 0) {
 #ifdef PADDLE_WITH_CUDA
     if (platform::is_gpu_place(place_)) {
-      gc.reset(new DefaultStreamGarbageCollector<Tensor>(
-          boost::get<platform::CUDAPlace>(place_), max_memory_size));
-    } else {
+      if (IsFastEagerDeletionModeEnabled()) {
+        gc.reset(new UnsafeFastGPUGarbageCollector(
+            boost::get<platform::CUDAPlace>(place_), max_memory_size));
+      } else {
+        gc.reset(new DefaultStreamGarbageCollector(
+            boost::get<platform::CUDAPlace>(place_), max_memory_size));
+      }
+    } else if (platform::is_cpu_place(place_)) {
 #endif
-      gc.reset(new CPUGarbageCollector<Tensor>(
-          boost::get<platform::CPUPlace>(place_), max_memory_size));
+      gc.reset(new CPUGarbageCollector(boost::get<platform::CPUPlace>(place_),
+                                       max_memory_size));
 #ifdef PADDLE_WITH_CUDA
     }
 #endif
+    // If gc is enabled and block size > 1
+    if (gc && ctx->prog_.Size() > 1) {
+      operators::PrepareSafeEagerDeletionOnWhileOpAndWhileGradOp(ctx->block_id_,
+                                                                 ctx->ops_);
+    }
   }
 
   for (auto& op : ctx->ops_) {
     op->Run(*local_scope, place_);
 
-    if (gc != nullptr) {
-      std::vector<std::string> erase_vars;
-      for (auto& input : op->Inputs()) {
-        for (auto& input_name : input.second) {
-          auto it = ctx->cur_ref_cnts_.find(input_name);
-          if (it == ctx->cur_ref_cnts_.end()) continue;
-          if (it->second == 1) {  // should delete it
-            erase_vars.emplace_back(input_name);
-            ctx->cur_ref_cnts_.erase(input_name);
-          } else {
-            --(it->second);
-          }
-        }
-      }
-
-      for (auto& output : op->Outputs()) {
-        for (auto& output_name : output.second) {
-          auto it = ctx->cur_ref_cnts_.find(output_name);
-          if (it == ctx->cur_ref_cnts_.end()) continue;
-          if (it->second == 1) {
-            erase_vars.emplace_back(output_name);
-            ctx->cur_ref_cnts_.erase(output_name);
-          } else {
-            --(it->second);
-          }
-        }
-      }
-
-      if (!erase_vars.empty()) {
-        std::vector<framework::LoDTensor*> erase_tensors;
-        for (auto& name : erase_vars) {
-          auto* var = local_scope->FindVar(name);
-          if (var == nullptr) continue;
-          if (var->IsType<framework::LoDTensor>()) {
-            auto* tensor = var->GetMutable<framework::LoDTensor>();
-            erase_tensors.push_back(tensor);
-          }
-        }
-        if (!erase_tensors.empty()) gc->Add(erase_tensors);
-      }
-    }
-
-    if (FLAGS_benchmark) {
-      VLOG(2) << "Memory used after operator " + op->Type() + " running: "
-              << memory::memory_usage(place_);
+    if (gc) {
+      DeleteUnusedTensors(*local_scope, op.get(), ctx->unused_vars_, gc.get());
     }
   }
 
-  if (gc != nullptr) {
-    gc->Wait();
-  } else {
-    platform::DeviceContextPool::Instance().Get(place_)->Wait();
-  }
+  platform::DeviceContextPool::Instance().Get(place_)->Wait();
 
   if (local_scope != scope) {
     scope->DeleteScope(local_scope);
@@ -417,13 +427,6 @@ void Executor::RunPreparedContext(ExecutorPrepareContext* ctx, Scope* scope,
       // we need to keep the kids and wait for the outer executor to drop them.
       scope->DropKids();
     }
-  }
-
-  if (FLAGS_benchmark) {
-    VLOG(2) << "-------------------------------------------------------";
-    VLOG(2) << "Memory used after deleting local scope: "
-            << memory::memory_usage(place_);
-    VLOG(2) << "-------------------------------------------------------";
   }
 }
 
@@ -481,6 +484,5 @@ void Executor::EnableMKLDNN(const ProgramDesc& program) {
       << "'MKLDNN' is not supported, Please re-compile with WITH_MKLDNN option";
 #endif
 }
-
 }  // namespace framework
 }  // namespace paddle
